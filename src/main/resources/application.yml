@@ -1,0 +1,34 @@
+spring:
+  application:
+    name: payflow-api
+
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/payflow}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+
+  # Disable Spring Security for now
+  autoconfigure:
+    exclude: org.springframework.boot.autoconfigure.security.servlet.SecurityAutoConfiguration
+
+server:
+  port: ${PORT:8080}
+  error:
+    include-message: always
+    include-binding-errors: always
+
+logging:
+  level:
+    com.payflow: DEBUG
+    org.springframework.web: INFO
+    org.hibernate: WARN
