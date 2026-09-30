@@ -40,4 +40,16 @@ dependencies {
 
 tasks.named('test') {
     useJUnitPlatform()
+    testLogging {
+        events 'failed'
+        exceptionFormat 'full'
+    }
+}
+
+tasks.named('bootJar') {
+    archiveFileName = 'payflow.jar'
+}
+
+tasks.named('jar') {
+    enabled = false
 }

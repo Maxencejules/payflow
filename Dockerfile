@@ -1,9 +1,12 @@
-FROM openjdk:17-jdk-slim
+FROM eclipse-temurin:17-jre
 
 WORKDIR /app
 
 # Copy the jar file
-COPY build/libs/*.jar app.jar
+COPY build/libs/payflow.jar app.jar
+
+ENV BIND_ADDRESS=0.0.0.0
+USER 10001:10001
 
 # Expose port
 EXPOSE 8080

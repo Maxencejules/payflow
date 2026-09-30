@@ -3,6 +3,9 @@ package com.payflow.api.repository;
 import com.payflow.api.model.Payment;
 import com.payflow.api.model.PaymentStatus;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import jakarta.persistence.LockModeType;
 import org.springframework.stereotype.Repository;
 
 import java.util.List;
@@ -16,6 +19,11 @@ import java.util.UUID;
  */
 @Repository
 public interface PaymentRepository extends JpaRepository<Payment, UUID> {
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select payment from Payment payment where payment.id = :id")
+    Optional<Payment> findByIdForUpdate(UUID id);
+
+    List<Payment> findByCustomerEmailIgnoreCaseOrderByCreatedAtDesc(String customerEmail);
 
     /**
      * Find a payment by its idempotency key.

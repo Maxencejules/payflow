@@ -1,6 +1,7 @@
 package com.payflow.api.dto;
 
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
 import lombok.Data;
 
 /**
@@ -16,5 +17,6 @@ public class ConfirmPaymentRequest {
      * Required for payment confirmation.
      */
     @NotBlank(message = "Payment method ID is required")
+    @Size(max = 100, message = "Payment method ID is too long")
     private String paymentMethodId;
 }

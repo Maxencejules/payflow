@@ -1,14 +1,14 @@
 package com.payflow.api.exception;
 
 import org.springframework.http.HttpStatus;
-import org.springframework.web.bind.annotation.ResponseStatus;
 
 /**
  * Custom exception for payment-related errors.
- * Automatically returns HTTP 400 Bad Request when thrown from controllers.
+ * Stable API status/code; the advice renders a JSON error without provider details.
  */
-@ResponseStatus(HttpStatus.BAD_REQUEST)
 public class PaymentException extends RuntimeException {
+    private final HttpStatus status;
+    private final String code;
 
     /**
      * Constructs a new payment exception with the specified detail message.
@@ -16,7 +16,7 @@ public class PaymentException extends RuntimeException {
      * @param message The detail message explaining the error
      */
     public PaymentException(String message) {
-        super(message);
+        this(HttpStatus.BAD_REQUEST, "invalid_request", message);
     }
 
     /**
@@ -26,6 +26,19 @@ public class PaymentException extends RuntimeException {
      * @param cause The cause of the exception
      */
     public PaymentException(String message, Throwable cause) {
-        super(message, cause);
+        this(HttpStatus.BAD_REQUEST, "invalid_request", message, cause);
     }
+
+    public PaymentException(HttpStatus status, String code, String message) {
+        this(status, code, message, null);
+    }
+
+    public PaymentException(HttpStatus status, String code, String message, Throwable cause) {
+        super(message, cause);
+        this.status = status;
+        this.code = code;
+    }
+
+    public HttpStatus getStatus() { return status; }
+    public String getCode() { return code; }
 }

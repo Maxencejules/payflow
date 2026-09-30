@@ -1,0 +1,8 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+logging:
+  level:
+    root: WARN
+    com.payflow: WARN

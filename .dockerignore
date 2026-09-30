@@ -1,9 +1,11 @@
+.git
 .gradle
 .idea
+.vscode
 build/classes
+build/generated
+build/reports
+build/test-results
 build/tmp
-*.iml
+**/__pycache__
 *.log
-.git
-.gitignore
-HELP.md
