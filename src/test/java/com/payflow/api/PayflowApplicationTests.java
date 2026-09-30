@@ -222,7 +222,7 @@ class PayflowApplicationTests {
         MvcResult customer = mvc.perform(get(API + "/customer/CUSTOMER@example.com")).andReturn();
         assertThat(customer.getResponse().getStatus()).isEqualTo(200);
         List<String> ids = read(customer, "$[*].id");
-        assertThat(ids).contains(read(created, "$.id"));
+        assertThat(ids).contains((String) read(created, "$.id"));
     }
 
     @Test
@@ -263,7 +263,7 @@ class PayflowApplicationTests {
         MvcResult lookup = mvc.perform(get(API + "/customer/" + email)).andReturn();
         assertThat(lookup.getResponse().getStatus()).isEqualTo(200);
         List<String> ids = read(lookup, "$[*].id");
-        assertThat(ids).contains(read(created, "$.id"));
+        assertThat(ids).contains((String) read(created, "$.id"));
     }
 
     @Test
@@ -301,8 +301,8 @@ class PayflowApplicationTests {
         MvcResult distinctHistory = mvc.perform(get(API + "/customer/customer@\u0131.com")).andReturn();
         List<String> firstIds = read(firstHistory, "$[*].id");
         List<String> distinctIds = read(distinctHistory, "$[*].id");
-        assertThat(firstIds).containsExactly(read(first, "$.id"));
-        assertThat(distinctIds).containsExactly(read(distinct, "$.id"));
+        assertThat(firstIds).containsExactly((String) read(first, "$.id"));
+        assertThat(distinctIds).containsExactly((String) read(distinct, "$.id"));
         verify(provider, times(2)).createPayment(any(Payment.class));
     }
 
