@@ -13,6 +13,8 @@ import java.util.Map;
 @Data
 @Builder
 public class ErrorResponse {
+    /** Stable machine-readable category */
+    private String code;
 
     /** Error message describing what went wrong */
     private String message;

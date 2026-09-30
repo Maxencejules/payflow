@@ -151,8 +151,8 @@ public class PaymentController {
         Map<String, String> info = new HashMap<>();
         info.put("service", "PayFlow Payment API");
         info.put("version", "1.0.0");
-        info.put("description", "Payment processing service");
-        info.put("documentation", "/api/docs");
+        info.put("description", "Deterministic payment simulation; no real money movement");
+        info.put("documentation", "https://github.com/Maxencejules/payflow#readme");
 
         return ResponseEntity.ok(info);
     }

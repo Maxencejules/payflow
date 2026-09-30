@@ -22,13 +22,14 @@ spring:
     exclude: org.springframework.boot.autoconfigure.security.servlet.SecurityAutoConfiguration
 
 server:
+  address: ${BIND_ADDRESS:127.0.0.1}
   port: ${PORT:8080}
   error:
-    include-message: always
-    include-binding-errors: always
+    include-message: never
+    include-binding-errors: never
 
 logging:
   level:
-    com.payflow: DEBUG
+    com.payflow: INFO
     org.springframework.web: INFO
     org.hibernate: WARN

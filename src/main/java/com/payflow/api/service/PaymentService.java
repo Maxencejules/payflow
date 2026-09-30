@@ -3,184 +3,180 @@ package com.payflow.api.service;
 import com.payflow.api.dto.CreatePaymentRequest;
 import com.payflow.api.dto.PaymentResponse;
 import com.payflow.api.exception.PaymentException;
+import com.payflow.api.exception.ProviderUnavailableException;
 import com.payflow.api.model.Payment;
 import com.payflow.api.model.PaymentStatus;
 import com.payflow.api.repository.PaymentRepository;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.ConnectionCallback;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Clock;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
+import java.util.Currency;
 import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
-/**
- * Core payment service handling business logic for payment operations.
- * Manages payment lifecycle, integrates with payment providers,
- * and ensures data consistency with transactional support.
- */
+/** PostgreSQL-backed lifecycle for a deterministic simulated payment provider. */
 @Service
 @RequiredArgsConstructor
-@Slf4j
 public class PaymentService {
-
     private final PaymentRepository paymentRepository;
     private final PaymentProviderService providerService;
+    private final JdbcTemplate jdbc;
+    private final Clock clock;
 
-    /**
-     * Creates a new payment with idempotency support.
-     * Prevents duplicate payments by checking idempotency key.
-     *
-     * @param request Payment creation request with amount and customer details
-     * @param idempotencyKey Optional key to prevent duplicate payments
-     * @return PaymentResponse with created payment details
-     */
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public PaymentResponse createPayment(CreatePaymentRequest request, String idempotencyKey) {
-        log.info("Creating payment: amount={}, currency={}, customer={}",
-                request.getAmount(), request.getCurrency(), request.getCustomerEmail());
-
-        // Check for existing payment with same idempotency key
+        String currency = validateCurrency(request);
+        String email = normalizeEmail(request.getCustomerEmail());
+        // Unicode case conversion can expand input that passed the raw DTO length check.
+        if (email.length() > 254) {
+            throw invalid("Normalized customer email is too long");
+        }
         if (idempotencyKey != null) {
-            var existingPayment = paymentRepository.findByIdempotencyKey(idempotencyKey);
-            if (existingPayment.isPresent()) {
-                log.info("Returning existing payment for idempotency key: {}", idempotencyKey);
-                return PaymentResponse.fromPayment(existingPayment.get());
+            if (!idempotencyKey.matches("[A-Za-z0-9._:-]{1,100}")) {
+                throw invalid("Idempotency-Key must contain 1 to 100 ASCII letters, digits, '.', '_', ':', or '-'");
+            }
+            // Same database transaction/connection as JPA. A hash collision only serializes unrelated keys.
+            // READ_COMMITTED gives the post-wait lookup a fresh snapshot of the winner's committed row.
+            jdbc.execute((ConnectionCallback<Void>) connection -> {
+                try (var statement = connection.prepareStatement(
+                        "select pg_advisory_xact_lock(hashtextextended(?, 0))")) {
+                    statement.setString(1, idempotencyKey);
+                    statement.execute();
+                }
+                return null;
+            });
+            var existing = paymentRepository.findByIdempotencyKey(idempotencyKey);
+            if (existing.isPresent()) {
+                Payment stored = existing.get();
+                if (stored.getAmount().compareTo(request.getAmount()) != 0
+                        || !stored.getCurrency().equalsIgnoreCase(currency)
+                        || !email.equals(normalizeEmail(stored.getCustomerEmail()))
+                        || !Objects.equals(stored.getCustomerId(), request.getCustomerId())
+                        || !Objects.equals(stored.getDescription(), request.getDescription())) {
+                    throw new PaymentException(HttpStatus.CONFLICT, "idempotency_conflict",
+                            "Idempotency-Key was already used with a different payment payload");
+                }
+                return PaymentResponse.fromPayment(stored);
             }
         }
-
-        // Create new payment entity
         Payment payment = new Payment();
         payment.setAmount(request.getAmount());
-        payment.setCurrency(request.getCurrency().toUpperCase());
-        payment.setCustomerEmail(request.getCustomerEmail());
+        payment.setCurrency(currency);
+        payment.setCustomerEmail(email);
         payment.setCustomerId(request.getCustomerId());
         payment.setDescription(request.getDescription());
         payment.setStatus(PaymentStatus.PENDING);
         payment.setIdempotencyKey(idempotencyKey);
-
-        // Initialize payment with provider
+        payment.setCreatedAt(now());
+        paymentRepository.saveAndFlush(payment); // Assign UUID before simulated initialization.
         try {
-            String providerId = providerService.createPayment(payment);
-            payment.setProviderPaymentId(providerId);
-            log.info("Payment initialized with provider: {}", providerId);
-        } catch (Exception e) {
-            log.error("Failed to create payment with provider", e);
-            payment.setStatus(PaymentStatus.FAILED);
-            payment.setFailureReason("Provider error: " + e.getMessage());
+            payment.setProviderPaymentId(providerService.createPayment(payment));
+        } catch (ProviderUnavailableException unavailable) {
+            throw unavailable(unavailable); // Roll back row and key; no provider acceptance happened.
         }
-
-        // Save payment to database
-        payment = paymentRepository.save(payment);
-        log.info("Payment created successfully: {}", payment.getId());
-
         return PaymentResponse.fromPayment(payment);
     }
 
-    /**
-     * Confirms a pending payment by processing it with the payment provider.
-     * Updates payment status based on provider response.
-     *
-     * @param paymentId UUID of the payment to confirm
-     * @param paymentMethodId Payment method to use for charging
-     * @return PaymentResponse with updated payment status
-     * @throws PaymentException if payment not found or in invalid state
-     */
-    @Transactional
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public PaymentResponse confirmPayment(UUID paymentId, String paymentMethodId) {
-        log.info("Confirming payment: {}", paymentId);
-
-        // Retrieve payment from database
-        Payment payment = paymentRepository.findById(paymentId)
-                .orElseThrow(() -> new PaymentException("Payment not found: " + paymentId));
-
-        // Validate payment state
-        if (payment.getStatus() != PaymentStatus.PENDING) {
-            throw new PaymentException(
-                    "Payment cannot be confirmed in status: " + payment.getStatus()
-            );
+        Payment payment = paymentRepository.findByIdForUpdate(paymentId).orElseThrow(PaymentService::missing);
+        if ((payment.getStatus() == PaymentStatus.COMPLETED || payment.getStatus() == PaymentStatus.FAILED)
+                && payment.getPaymentMethodId() != null) {
+            if (!payment.getPaymentMethodId().equals(paymentMethodId)) {
+                throw new PaymentException(HttpStatus.CONFLICT, "confirmation_conflict",
+                        "Payment was already confirmed with a different payment method");
+            }
+            return PaymentResponse.fromPayment(payment);
         }
-
-        // Update payment with processing status
+        if (payment.getStatus() != PaymentStatus.PENDING) {
+            throw new PaymentException(HttpStatus.CONFLICT, "state_conflict",
+                    "Payment cannot be confirmed in status: " + payment.getStatus());
+        }
         payment.setStatus(PaymentStatus.PROCESSING);
         payment.setPaymentMethodId(paymentMethodId);
-
-        // Process payment with provider
+        final boolean successful;
         try {
-            boolean success = providerService.confirmPayment(
-                    payment.getProviderPaymentId(),
-                    paymentMethodId
-            );
-
-            if (success) {
-                payment.setStatus(PaymentStatus.COMPLETED);
-                payment.setCompletedAt(LocalDateTime.now());
-                log.info("Payment confirmed successfully: {}", paymentId);
-            } else {
-                payment.setStatus(PaymentStatus.FAILED);
-                payment.setFailureReason("Payment confirmation failed");
-                log.warn("Payment confirmation failed: {}", paymentId);
-            }
-        } catch (Exception e) {
-            log.error("Error confirming payment: {}", paymentId, e);
-            payment.setStatus(PaymentStatus.FAILED);
-            payment.setFailureReason(e.getMessage());
+            successful = providerService.confirmPayment(payment.getProviderPaymentId(), paymentMethodId);
+        } catch (ProviderUnavailableException unavailable) {
+            throw unavailable(unavailable); // Restore PENDING, including method and timestamps.
         }
-
-        // Save updated payment
-        payment = paymentRepository.save(payment);
+        payment.setStatus(successful ? PaymentStatus.COMPLETED : PaymentStatus.FAILED);
+        payment.setCompletedAt(successful ? now() : null);
+        payment.setFailureReason(successful ? null : "Payment was declined by the simulated provider");
         return PaymentResponse.fromPayment(payment);
     }
 
-    /**
-     * Retrieves a payment by its ID.
-     *
-     * @param paymentId UUID of the payment
-     * @return PaymentResponse with payment details
-     * @throws PaymentException if payment not found
-     */
+    @Transactional(readOnly = true)
     public PaymentResponse getPayment(UUID paymentId) {
-        log.debug("Fetching payment: {}", paymentId);
-
-        Payment payment = paymentRepository.findById(paymentId)
-                .orElseThrow(() -> new PaymentException("Payment not found: " + paymentId));
-
-        return PaymentResponse.fromPayment(payment);
+        return PaymentResponse.fromPayment(paymentRepository.findById(paymentId).orElseThrow(PaymentService::missing));
     }
 
-    /**
-     * Retrieves all payments for a customer by email.
-     * Returns payments sorted by creation date (newest first).
-     *
-     * @param email Customer email address
-     * @return List of payments for the customer
-     */
+    @Transactional(readOnly = true)
     public List<PaymentResponse> getPaymentsByEmail(String email) {
-        log.debug("Fetching payments for customer: {}", email);
-
-        return paymentRepository.findByCustomerEmailOrderByCreatedAtDesc(email)
+        String normalized = normalizeEmail(email);
+        return paymentRepository.findByCustomerEmailIgnoreCaseOrderByCreatedAtDesc(normalized)
                 .stream()
-                .map(PaymentResponse::fromPayment)
-                .collect(Collectors.toList());
+                // Database case folding can collapse distinct ROOT-normalized Unicode addresses.
+                .filter(payment -> Objects.equals(normalized, normalizeEmail(payment.getCustomerEmail())))
+                .map(PaymentResponse::fromPayment).toList();
     }
 
-    /**
-     * Checks if the payment service is healthy.
-     * Verifies database connectivity and provider availability.
-     *
-     * @return true if service is operational
-     */
     public boolean isHealthy() {
         try {
-            // Check database connectivity
             paymentRepository.count();
-            // Check provider connectivity
             return providerService.isHealthy();
-        } catch (Exception e) {
-            log.error("Health check failed", e);
+        } catch (RuntimeException unavailable) {
             return false;
         }
+    }
+
+    private LocalDateTime now() {
+        // PostgreSQL stores microseconds; the original response must match later reads/replays.
+        return LocalDateTime.now(clock).truncatedTo(ChronoUnit.MICROS);
+    }
+
+    private static String normalizeEmail(String email) {
+        return email == null ? null : email.toLowerCase(Locale.ROOT);
+    }
+
+    private static String validateCurrency(CreatePaymentRequest request) {
+        String code = request.getCurrency().toUpperCase(Locale.ROOT);
+        final Currency currency;
+        try {
+            currency = Currency.getInstance(code);
+        } catch (IllegalArgumentException invalidCode) {
+            throw invalid("Currency must be a supported ISO 4217 code");
+        }
+        int digits = currency.getDefaultFractionDigits();
+        if (digits < 0 || digits > 2) {
+            throw invalid("Only currencies with zero to two minor-unit digits are supported");
+        }
+        if (request.getAmount().stripTrailingZeros().scale() > digits) {
+            throw invalid("Amount has too many fractional digits for this currency");
+        }
+        return code;
+    }
+
+    private static PaymentException invalid(String message) {
+        return new PaymentException(HttpStatus.BAD_REQUEST, "invalid_request", message);
+    }
+
+    private static PaymentException missing() {
+        return new PaymentException(HttpStatus.NOT_FOUND, "payment_not_found", "Payment not found");
+    }
+
+    private static PaymentException unavailable(ProviderUnavailableException cause) {
+        return new PaymentException(HttpStatus.SERVICE_UNAVAILABLE, "provider_unavailable",
+                "Simulated provider unavailable before acceptance; retry is safe", cause);
     }
 }

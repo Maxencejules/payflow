@@ -4,7 +4,6 @@ import jakarta.persistence.*;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.AllArgsConstructor;
-import org.hibernate.annotations.CreationTimestamp;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -34,9 +33,8 @@ public class Payment {
     private UUID id;
 
     /**
-     * Payment amount in the smallest currency unit.
-     * For USD, this would be cents (e.g., 1000 = $10.00).
-     * Using BigDecimal for precise monetary calculations.
+     * Decimal amount in major currency units (12.50 USD means 12 dollars and 50 cents).
+     * Existing numeric storage is preserved; API validation prevents rounding new input.
      */
     @Column(nullable = false)
     private BigDecimal amount;
@@ -98,16 +96,15 @@ public class Payment {
 
     /**
      * Idempotency key to prevent duplicate payment processing.
-     * Ensures exactly-once semantics for payment creation.
+     * Serializes creation/replay within PostgreSQL; does not guarantee real gateway exactly-once effects.
      */
     @Column(name = "idempotency_key", unique = true)
     private String idempotencyKey;
 
     /**
      * Timestamp when the payment was created.
-     * Automatically set by Hibernate on entity creation.
+     * Set by the service in UTC, at PostgreSQL microsecond precision.
      */
-    @CreationTimestamp
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 

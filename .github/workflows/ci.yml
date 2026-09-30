@@ -12,7 +12,7 @@ jobs:
   postgres:
     name: PostgreSQL ${{ matrix.postgres }} payment invariants
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -41,6 +41,40 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Verify database transactions and build the runnable jar
         run: ./gradlew --no-daemon test bootJar
+      - name: Real HTTP demo and persisted receipt replay after restart
+        shell: bash
+        run: |
+          mkdir -p build/demo
+          app_pid=""
+          cleanup() {
+            if [[ -n "$app_pid" ]]; then
+              kill "$app_pid" 2>/dev/null || true
+              wait "$app_pid" 2>/dev/null || true
+              app_pid=""
+            fi
+          }
+          trap cleanup EXIT
+          start_app() {
+            java -jar build/libs/payflow.jar > "build/demo/app-$1.log" 2>&1 &
+            app_pid=$!
+            for attempt in {1..60}; do
+              if curl --fail --silent http://127.0.0.1:8080/api/v1/payments/health > /dev/null; then
+                return
+              fi
+              if ! kill -0 "$app_pid" 2>/dev/null; then break; fi
+              sleep 1
+            done
+            cat "build/demo/app-$1.log"
+            exit 1
+          }
+          start_app initial
+          python scripts/demo.py --output build/demo/proof.json
+          cleanup
+          start_app restarted
+          python scripts/demo.py --verify-receipts build/demo/proof.json | tee build/demo/restart-proof.json
+      - name: Build the runtime container from the executable jar
+        if: matrix.postgres == '15'
+        run: docker build --tag payflow:ci .
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -48,3 +82,4 @@ jobs:
           path: |
             build/test-results/test/
             build/reports/tests/test/
+            build/demo/

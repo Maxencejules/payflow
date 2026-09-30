@@ -6,8 +6,8 @@ package com.payflow.api.model;
  * State transitions:
  * PENDING -> PROCESSING -> COMPLETED
  * PENDING -> PROCESSING -> FAILED
- * COMPLETED -> REFUNDED
- * COMPLETED -> PARTIALLY_REFUNDED
+ * PROCESSING is transaction-local; unavailable simulation rolls back to PENDING.
+ * Cancellation/refund values are retained for existing data, with no transitions/endpoints implemented.
  */
 public enum PaymentStatus {
     /** Initial state when payment is created */

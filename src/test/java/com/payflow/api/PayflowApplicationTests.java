@@ -2,6 +2,8 @@ package com.payflow.api;
 
 import com.jayway.jsonpath.JsonPath;
 import com.payflow.api.exception.ProviderUnavailableException;
+import com.payflow.api.dto.CreatePaymentRequest;
+import jakarta.validation.Validator;
 import com.payflow.api.model.Payment;
 import com.payflow.api.model.PaymentStatus;
 import com.payflow.api.repository.PaymentRepository;
@@ -9,6 +11,9 @@ import com.payflow.api.service.PaymentProviderService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -21,6 +26,7 @@ import org.springframework.test.web.servlet.MvcResult;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -36,6 +42,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 
 /** Requires PostgreSQL: no H2 substitute for transaction or lock behavior. */
 @SpringBootTest
@@ -48,6 +55,7 @@ class PayflowApplicationTests {
     @Autowired PaymentRepository payments;
     @Autowired JdbcTemplate jdbc;
     @Autowired DataSource dataSource;
+    @Autowired Validator validator;
     @MockitoSpyBean PaymentProviderService provider;
 
     @BeforeEach
@@ -189,6 +197,178 @@ class PayflowApplicationTests {
     void missingPaymentAndMalformedIdentifiersHaveUsefulStatusCodes() throws Exception {
         assertThat(mvc.perform(get(API + "/" + UUID.randomUUID())).andReturn().getResponse().getStatus()).isEqualTo(404);
         assertThat(mvc.perform(get(API + "/not-a-uuid")).andReturn().getResponse().getStatus()).isEqualTo(400);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"0,USD", "-1,USD", "0.001,USD", "12.501,USD", "100000000000000000,USD",
+            "1.1,JPY", "1,BHD", "1,XXX", "1,ZZZ", "1,u$D"})
+    void invalidMoneyIsRejectedBeforeProviderOrDatabaseCreation(String amount, String currency) throws Exception {
+        String key = UUID.randomUUID().toString();
+        MvcResult result = create(body(amount, currency, "customer@example.com"), key);
+        assertThat(result.getResponse().getStatus()).isEqualTo(400);
+        assertThat((String) read(result, "$.code")).isEqualTo("invalid_request");
+        assertThat(payments.findByIdempotencyKey(key)).isEmpty();
+        verify(provider, never()).createPayment(any(Payment.class));
+    }
+
+    @Test
+    void validZeroDigitCurrencyAndCaseInsensitiveCustomerLookupWork() throws Exception {
+        MvcResult created = create(body("100.00", "jpy", "Customer@example.com"), UUID.randomUUID().toString());
+        assertThat(created.getResponse().getStatus()).isEqualTo(201);
+        assertThat((String) read(created, "$.currency")).isEqualTo("JPY");
+        assertThat((String) read(created, "$.customerEmail")).isEqualTo("customer@example.com");
+        MvcResult fetched = mvc.perform(get(API + "/" + read(created, "$.id"))).andReturn();
+        assertThat((String) read(fetched, "$.createdAt")).isEqualTo(read(created, "$.createdAt"));
+        MvcResult customer = mvc.perform(get(API + "/customer/CUSTOMER@example.com")).andReturn();
+        assertThat(customer.getResponse().getStatus()).isEqualTo(200);
+        List<String> ids = read(customer, "$[*].id");
+        assertThat(ids).contains(read(created, "$.id"));
+    }
+
+    @Test
+    void malformedBodyLengthsAndKeysAreRejectedWithoutProviderCalls() throws Exception {
+        assertThat(create("{bad json", "bad-json").getResponse().getStatus()).isEqualTo(400);
+        for (String key : List.of("", "contains space", "x".repeat(101), "non-ascii-\u00e9")) {
+            assertThat(create(body("12.50", "USD", "customer@example.com"), key).getResponse().getStatus()).isEqualTo(400);
+        }
+        String longDescription = body("12.50", "USD", "customer@example.com")
+                .replace("Demo payment", "x".repeat(256));
+        assertThat(create(longDescription, "long-description").getResponse().getStatus()).isEqualTo(400);
+        verify(provider, never()).createPayment(any(Payment.class));
+    }
+
+    @Test
+    void validRawUnicodeEmailCannotExpandPastTheNormalizedStorageContract() throws Exception {
+        String email = "\u0130".repeat(60) + "@" + ("a".repeat(40) + ".").repeat(4) + "com";
+        CreatePaymentRequest request = new CreatePaymentRequest();
+        request.setAmount(new BigDecimal("12.50"));
+        request.setCurrency("USD");
+        request.setCustomerEmail(email);
+        assertThat(email.length()).isLessThan(254);
+        assertThat(validator.validate(request)).as("Fixture must pass actual raw DTO validation").isEmpty();
+        String key = UUID.randomUUID().toString();
+        MvcResult result = create(body("12.50", "USD", email), key);
+        assertThat(result.getResponse().getStatus()).isEqualTo(400);
+        assertThat((String) read(result, "$.code")).isEqualTo("invalid_request");
+        assertThat(payments.findByIdempotencyKey(key)).isEmpty();
+        verify(provider, never()).createPayment(any(Payment.class));
+    }
+
+    @Test
+    void unicodeCustomerLookupUsesTheSameNormalizationAsStorage() throws Exception {
+        String email = "a@\u0130.com";
+        MvcResult created = create(body("12.50", "USD", email), UUID.randomUUID().toString());
+        assertThat(created.getResponse().getStatus()).isEqualTo(201);
+        assertThat((String) read(created, "$.customerEmail")).isEqualTo("a@i\u0307.com");
+        MvcResult lookup = mvc.perform(get(API + "/customer/" + email)).andReturn();
+        assertThat(lookup.getResponse().getStatus()).isEqualTo(200);
+        List<String> ids = read(lookup, "$[*].id");
+        assertThat(ids).contains(read(created, "$.id"));
+    }
+
+    @Test
+    void aLegacyRawUnicodeEmailCanReplayWithoutChangingItsRecordOrProviderReference() throws Exception {
+        String email = "a@\u0130.com";
+        String key = UUID.randomUUID().toString();
+        MvcResult created = create(body("12.50", "USD", email), key);
+        assertThat(created.getResponse().getStatus()).isEqualTo(201);
+        UUID id = UUID.fromString(read(created, "$.id"));
+        Payment legacy = payments.findById(id).orElseThrow();
+        legacy.setCustomerEmail(email); // The baseline persisted the raw request email.
+        String reference = legacy.getProviderPaymentId();
+        payments.saveAndFlush(legacy);
+        MvcResult replay = create(body("12.50", "USD", email), key);
+        assertThat(replay.getResponse().getStatus()).isEqualTo(201);
+        assertThat((String) read(replay, "$.id")).isEqualTo(id.toString());
+        assertThat(payments.findById(id).orElseThrow().getCustomerEmail()).isEqualTo(email);
+        assertThat(payments.findById(id).orElseThrow().getProviderPaymentId()).isEqualTo(reference);
+        verify(provider, times(1)).createPayment(any(Payment.class));
+    }
+
+    @Test
+    void distinctRootNormalizedDomainsConflictOnReplayAndDoNotMixCustomerHistory() throws Exception {
+        String key = UUID.randomUUID().toString();
+        MvcResult first = create(body("12.50", "USD", "customer@I.com"), key);
+        assertThat(first.getResponse().getStatus()).isEqualTo(201);
+        MvcResult conflict = create(body("12.50", "USD", "customer@\u0131.com"), key);
+        assertThat(conflict.getResponse().getStatus()).isEqualTo(409);
+        assertThat((String) read(conflict, "$.code")).isEqualTo("idempotency_conflict");
+        verify(provider, times(1)).createPayment(any(Payment.class));
+        MvcResult distinct = create(body("12.50", "USD", "customer@\u0131.com"), UUID.randomUUID().toString());
+        assertThat(distinct.getResponse().getStatus()).isEqualTo(201);
+        assertThat((String) read(distinct, "$.id")).isNotEqualTo(read(first, "$.id"));
+        MvcResult firstHistory = mvc.perform(get(API + "/customer/customer@I.com")).andReturn();
+        MvcResult distinctHistory = mvc.perform(get(API + "/customer/customer@\u0131.com")).andReturn();
+        List<String> firstIds = read(firstHistory, "$[*].id");
+        List<String> distinctIds = read(distinctHistory, "$[*].id");
+        assertThat(firstIds).containsExactly(read(first, "$.id"));
+        assertThat(distinctIds).containsExactly(read(distinct, "$.id"));
+        verify(provider, times(2)).createPayment(any(Payment.class));
+    }
+
+    @Test
+    void omittingAKeyCreatesIndependentPayments() throws Exception {
+        String body = body("12.50", "USD", "customer@example.com");
+        MvcResult first = mvc.perform(post(API).contentType(MediaType.APPLICATION_JSON).content(body)).andReturn();
+        MvcResult second = mvc.perform(post(API).contentType(MediaType.APPLICATION_JSON).content(body)).andReturn();
+        assertThat(first.getResponse().getStatus()).isEqualTo(201);
+        assertThat(second.getResponse().getStatus()).isEqualTo(201);
+        assertThat((String) read(first, "$.id")).isNotEqualTo(read(second, "$.id"));
+        verify(provider, times(2)).createPayment(any(Payment.class));
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = PaymentStatus.class, names = {"PROCESSING", "CANCELLED", "REFUNDED", "PARTIALLY_REFUNDED"})
+    void incompatibleLegacyStatesAreRejectedWithoutProviderCalls(PaymentStatus status) throws Exception {
+        UUID id = pending();
+        Payment stored = payments.findById(id).orElseThrow();
+        stored.setStatus(status);
+        payments.saveAndFlush(stored);
+        MvcResult result = confirm(id, "pm_success");
+        assertThat(result.getResponse().getStatus()).isEqualTo(409);
+        assertThat((String) read(result, "$.code")).isEqualTo("state_conflict");
+        assertThat(payments.findById(id).orElseThrow().getStatus()).isEqualTo(status);
+        verify(provider, never()).confirmPayment(anyString(), anyString());
+    }
+
+    @Test
+    void unexpectedProviderErrorsAreSanitizedAndRollBackConfirmation() throws Exception {
+        UUID id = pending();
+        doThrow(new IllegalArgumentException("private provider detail")).when(provider).confirmPayment(anyString(), anyString());
+        MvcResult result = confirm(id, "pm_success");
+        assertThat(result.getResponse().getStatus()).isEqualTo(500);
+        assertThat((String) read(result, "$.code")).isEqualTo("internal_error");
+        assertThat(result.getResponse().getContentAsString()).doesNotContain("private provider detail");
+        Payment stored = payments.findById(id).orElseThrow();
+        assertThat(stored.getStatus()).isEqualTo(PaymentStatus.PENDING);
+        assertThat(stored.getPaymentMethodId()).isNull();
+        assertThat(stored.getCompletedAt()).isNull();
+        assertThat(stored.getFailureReason()).isNull();
+    }
+
+    @Test
+    void actualSimulatedUnavailabilityAndUnknownMethodsDoNotChangePendingPayment() throws Exception {
+        UUID id = pending();
+        doCallRealMethod().when(provider).confirmPayment(anyString(), anyString());
+        assertThat(confirm(id, "pm_unavailable").getResponse().getStatus()).isEqualTo(503);
+        assertThat(confirm(id, "pm_unknown").getResponse().getStatus()).isEqualTo(400);
+        Payment stored = payments.findById(id).orElseThrow();
+        assertThat(stored.getStatus()).isEqualTo(PaymentStatus.PENDING);
+        assertThat(stored.getPaymentMethodId()).isNull();
+        assertThat((String) read(confirm(id, "pm_success"), "$.status")).isEqualTo("COMPLETED");
+    }
+
+    @Test
+    void wrongRouteMethodAndMediaTypeKeepJsonErrorContracts() throws Exception {
+        MvcResult missingRoute = mvc.perform(get("/not-a-route")).andReturn();
+        assertThat(missingRoute.getResponse().getStatus()).isEqualTo(404);
+        assertThat((String) read(missingRoute, "$.code")).isEqualTo("route_not_found");
+        MvcResult wrongMethod = mvc.perform(put(API)).andReturn();
+        assertThat(wrongMethod.getResponse().getStatus()).isEqualTo(405);
+        assertThat((String) read(wrongMethod, "$.code")).isEqualTo("method_not_allowed");
+        MvcResult wrongMedia = mvc.perform(post(API).contentType(MediaType.TEXT_PLAIN).content("body")).andReturn();
+        assertThat(wrongMedia.getResponse().getStatus()).isEqualTo(415);
+        assertThat((String) read(wrongMedia, "$.code")).isEqualTo("unsupported_media_type");
     }
 
     private UUID pending() throws Exception {

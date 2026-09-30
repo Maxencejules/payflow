@@ -45,3 +45,11 @@ tasks.named('test') {
         exceptionFormat 'full'
     }
 }
+
+tasks.named('bootJar') {
+    archiveFileName = 'payflow.jar'
+}
+
+tasks.named('jar') {
+    enabled = false
+}
